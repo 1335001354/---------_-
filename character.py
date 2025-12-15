@@ -5,7 +5,7 @@ from typing import Any
 class Timer:
     """
     计时器类
-    管理当前时间（单位由你自己决定：秒、帧、回合等）
+    管理当前时间（单位自定义：秒、帧、回合等）
     """
     def __init__(self, total_time=None):
         self.current_time = 0
@@ -92,8 +92,18 @@ class State:
             self.current = min(self.upper_limit, self.current + 1)
             self.start_time = timer.current_time
         elif self.type == 2:
-            self.start_time.sort(key = lambda x: float("inf") if x is None else x)
-            self.start_time[0] = timer.current_time
+            # 先清理过期
+            for i, t in enumerate(self.start_time):
+                if t is not None and timer.current_time - t > self.time:
+                    self.start_time[i] = None
+            # 优先填空槽
+            if None in self.start_time:
+                idx = self.start_time.index(None)
+                self.start_time[idx] = timer.current_time
+            else:
+                # 全满，替换最早的
+                idx = min(range(len(self.start_time)), key=lambda i: self.start_time[i])
+                self.start_time[idx] = timer.current_time
             active = sum(1 for t in self.start_time if t is not None and timer.current_time - t <= self.time)
             self.current = min(self.upper_limit, active)
 
@@ -111,10 +121,12 @@ class State:
                 self.start_time = 0
         elif self.type == 2:
             active_count = 0
-            for t in self.start_time:
+            for i, t in enumerate(self.start_time):
                 if t is None:
                     continue
-                if timer.current_time - t <= self.time:
+                if timer.current_time - t > self.time:
+                    self.start_time[i] = None
+                else:
                     active_count += 1
             self.current = min(self.upper_limit, active_count)
 
@@ -231,11 +243,12 @@ class Resource:
         amount < 0: 消耗资源
         amount > 0: 获得资源（不超过上限）
         """
+        EPS = 1e-9
         if amount < 0:
-            if self.current + amount < 0:
+            if self.current + amount < -EPS:
                 raise ValueError(f"资源 {self.id} 数量不足")
             self.consume_total -= amount  # amount 是负数，实际消耗是 -amount
-            self.current += amount
+            self.current = max(0, self.current + amount)
         elif amount > 0:
             self.current = min(self.upper_limit, self.current + amount)
 
@@ -762,7 +775,7 @@ class Operation:
 
 
     # ---------- 内部：状态合法性检查 ----------
-    def _check_state_conditions(self):
+    def _check_state_conditions(self, state_override=None):
         """
         检查状态是否满足释放条件：
         - 所有 state_requirements: state.current >= min_stack
@@ -770,12 +783,12 @@ class Operation:
         """
         # 必须存在的状态
         for st, need in self.state_requirements:
-            if st.current < need:
+            cur = state_override[st].current if state_override and st in state_override else st.current
+            if cur < need:
                 return False
-
-        # 禁止存在的状态
         for st in self.state_forbids:
-            if st.current > 0:
+            cur = state_override[st].current if state_override and st in state_override else st.current
+            if cur > 0:
                 return False
 
         return True
@@ -798,12 +811,18 @@ class Operation:
     # ---------- 综合合法性：资源 + 状态 ----------
     def test(self, state_manager=None):
         """
-        返回当前时刻该技能是否可以释放：
-        - 状态条件不满足 ⇒ False
-        - 任意一个资源的“理论消耗量” > 当前值 ⇒ False
+        返回当前时刻该技能是否可以释放（真实执行判定）：
+        - 状态条件（真实 State）
+        - consume_lower_limit
+        - 理论消耗 <= 当前资源
         """
-        if not self._check_state_conditions():
+        if not self._check_state_conditions(state_override=None):
             return False
+        
+        if self.consume_lower_limit is not None:
+            for res in self.resource_requirements:
+                if res.current < self.consume_lower_limit:
+                    return False
 
         consume_map = self._calc_consume_amounts(state_manager=state_manager)
 
@@ -876,13 +895,20 @@ class MetaOperation:
     - base_priority: 基础优先级（整数，越大越优先）
     """
 
-    def __init__(self, id, operations, type=1, meta_state_requirements=None, meta_state_forbids=None, base_priority=0):
+    def __init__(self, id, operations, type=1, meta_state_requirements=None, meta_state_forbids=None, base_priority=0, on_success_states = None, n: int | None = None):
         self.id = id
         self.operations = list(operations)
         self.type = type
         self.meta_state_requirements = list(meta_state_requirements) if meta_state_requirements else []
         self.meta_state_forbids = list(meta_state_forbids) if meta_state_forbids else []
         self.base_priority = base_priority
+        self.on_success_states = list(on_success_states) if on_success_states else []
+        self.n = n # 尾部循环长度
+        if self.n is not None:
+            if self.n <= 0:
+                raise ValueError("MetaOperation 的 n 必须是正整数或 None")
+            if self.n >= len(self.operations):
+                raise ValueError("MetaOperation 的 n 必须小于操作总数")
     
     def _check_meta_state_conditions(self, state_manager: StateManager):
         """
@@ -998,7 +1024,7 @@ class MetaOperation:
         shadow_manager = StateManager(list(shadow_map.values()))
         return shadow_map, shadow_manager
 
-    def _simulate_full(self, timer: Timer, state_manager: StateManager):
+    def _simulate_full(self, timer: Timer, state_manager: StateManager, regen_rules = None):
         """
         使用影子 Resource / Timer / State 来完整模拟整个元操作：
         - 状态条件用影子State判断
@@ -1027,7 +1053,18 @@ class MetaOperation:
         shadow_timer = Timer(total_time=timer.total_time)
         shadow_timer.current_time = timer.current_time
 
+        def _regen_allowed(rule: ResourceRegenRule):
+            # 检查 regen_rule 的状态条件是否满足
+            for st, need in rule.state_requirements:
+                if shadow_state_map[st].current < need:
+                    return False
+            for st in rule.state_forbids:
+                if shadow_state_map[st].current > 0:
+                    return False
+            return True
+        
         # ---------- 按顺序模拟每个 Operation ----------
+        last_tick = shadow_timer.current_time
         for op in self.operations:
             # 1. 用影子状态检查状态条件
             if not op._check_state_conditions_shadow(shadow_state_map):
@@ -1044,11 +1081,12 @@ class MetaOperation:
             consume_map = op._calc_consume_amounts(state_override=shadow_state_map, state_manager=shadow_state_manager)
 
             # 扣除资源：任一步 cur < need ⇒ 整个失败
+            EPS = 1e-9
             for res, need in consume_map.items():
                 cur, lim = temp[res]
-                if cur < need:
+                if cur + EPS < need:
                     return False
-                temp[res][0] = cur - need
+                temp[res][0] = max(cur - need, 0)
 
             # 4. 模拟资源产出
             produce_map = op._calc_produce_amounts(state_override=shadow_state_map, state_manager=shadow_state_manager)
@@ -1062,6 +1100,15 @@ class MetaOperation:
             # 5. 推进影子时间 & 状态过期
             eff_time = op.get_effective_time(shadow_state_manager)
             shadow_timer.update(eff_time)
+            if regen_rules:
+                dt = shadow_timer.current_time - last_tick
+                if dt > 0:
+                    for rule in regen_rules:
+                        # rule.resource是真实的Resource对象，用它来索引temp
+                        r = rule.resource
+                        if r in temp and _regen_allowed(rule):
+                            temp[r][0] = min(temp[r][1], temp[r][0] + rule.rate_per_sec * dt)
+                last_tick = shadow_timer.current_time
             shadow_state_manager.update(shadow_timer)
 
             # 6. 本操作直接施加的状态，作用在影子状态上
@@ -1070,7 +1117,7 @@ class MetaOperation:
 
         return True
 
-    def can_execute(self, timer: Timer = None, state_manager: StateManager = None):
+    def can_execute(self, timer: Timer = None, state_manager: StateManager = None, character = None):
         """
         当前资源 + 状态 下，是否可以完整执行整个元操作。
         type=1：直接 all(op.test())
@@ -1085,7 +1132,8 @@ class MetaOperation:
         elif self.type == 2:
             if timer is None or state_manager is None:
                 raise ValueError("MetaOperation(type=2).can_execute() 需要提供 timer 和 state_manager")
-            return self._simulate_full(timer, state_manager)
+            return self._simulate_full(timer, state_manager, regen_rules=getattr(character, "resource_regen_rules", None))
+
 
         else:
             raise ValueError("MetaOperation.type 只能为 1 或 2")
@@ -1093,20 +1141,64 @@ class MetaOperation:
     def execute(self, timer: Timer, state_manager: StateManager = None, record_list=None, character = None):
         """
         真正执行整个元操作。
+        - prefix: 顺序执行一次
+        - tail: 循环执行，任意一个op放不出就停
+        关键：每次op.operate推进时间后，立刻结算character的时间回复（regen）
         """
-        if not self.can_execute(timer, state_manager):
+        if not self.can_execute(timer=timer, state_manager=state_manager, character=character):
             raise ValueError(f"当前资源或状态不足，无法发动元操作 {self.id}")
 
         if record_list is None:
             record_list = []
-
-        for op in self.operations:
+        
+        # --- 先拆分: prefix + tail ---
+        ops = self.operations
+        n = self.n
+        if n is None:
+            prefix_ops = ops
+            tail_ops = []
+        else:
+            prefix_ops = ops[:-n]
+            tail_ops = ops[-n:]
+        
+        # --- 执行 prefix ---
+        for op in prefix_ops:
             rec = op.operate(timer, state_manager)
             record_list.append(rec)
             if character is not None:
+                character._apply_time_regen()
                 character._after_operation_executed(op)
-            if state_manager is not None:
-                state_manager.update(timer)
+            else:
+                if state_manager is not None:
+                    state_manager.update(timer)
+        # --- 执行 tail ---
+        while tail_ops:
+            # 打断条件：出现更高优先级元操作激活（或进入队列）
+            if character is not None and character._has_higher_priority_meta_active(self):
+                break
+            
+            # 逐个执行tail操作，任意一个失败就停止tail
+            broke = False
+            for op in tail_ops:
+                try:
+                    rec = op.operate(timer, state_manager)
+                except Exception as e:
+                    broke = True
+                    break
+                record_list.append(rec)
+                if character is not None:
+                    character._apply_time_regen()
+                    character._after_operation_executed(op)
+                else:
+                    if state_manager is not None:
+                        state_manager.update(timer)
+            if broke:
+                break
+        # --- 3) 元操作成功后状态 ---
+        for st in self.on_success_states:
+            st.add(timer)
+        if state_manager is not None:
+            state_manager.update(timer)
 
         return record_list
 
@@ -1257,6 +1349,24 @@ class Character:
         self._last_tick_time = self.timer.current_time
         self.op_triggered_state_rules = []
     
+    def _has_higher_priority_meta_active(self, current_mop: MetaOperation) -> bool:
+        """
+        只要出现 priority > 当前元操作优先级 的元操作被激活（priority != None），就返回 True。
+        """
+        cur_pr = current_mop.get_priority(self.state_manager)
+        if cur_pr is None:
+            return True  # 当前都不该继续了
+
+        for mop in self.meta_operations:
+            if mop is current_mop:
+                continue
+            pr = mop.get_priority(self.state_manager)
+            if pr is None:
+                continue
+            if pr > cur_pr and mop.can_execute(timer = self.timer, state_manager=self.state_manager, character=self):
+                return True
+        return False
+    
     def add_op_trigger_rule(self, rule: OperationTriggeredStateRule):
         self.op_triggered_state_rules.append(rule)   
     
@@ -1330,9 +1440,8 @@ class Character:
 
             executed = False
             for _, mop in candidate_list:
-                if mop.can_execute(self.timer, self.state_manager):
+                if mop.can_execute(timer = self.timer, state_manager = self.state_manager, character = self):
                     mop.execute(self.timer, self.state_manager, record_list=rotation_log, character=self)
-                    self._apply_time_regen()
                     steps += 1
                     executed = True
                     break
