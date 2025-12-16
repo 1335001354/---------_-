@@ -60,7 +60,7 @@ class State:
         - 状态结束（current=0）后，优先级自动恢复为 base_priority。
     8. op_accelerate_rules: 状态存在时对操作生效的加速规则列表 [OperationAccelerate,...]
     """
-    def __init__(self, id, current, upper_limit, time, type, length, resource_effects=None, meta_priority_rules=None, op_accelerate_rules=None, op_efficiency_rules=None):
+    def __init__(self, id, current, upper_limit, time, type, length, resource_effects=None, meta_priority_rules=None, op_accelerate_rules=None, op_efficiency_rules=None, expire_mode="time"):
         self.id = id
         self.current = current
         self.upper_limit = upper_limit
@@ -68,6 +68,7 @@ class State:
         self.type = type
         self.length = length
         self.resource_effects = list(resource_effects) if resource_effects else []
+        self.expire_mode = expire_mode  # "time" 或 "resource"
         # 元操作优先级规则：
         # 结构：[(meta_op, priority_delta), ...]
         # - 默认：None 或 [] -> 不修改优先级
@@ -86,6 +87,8 @@ class State:
             raise ValueError("未知的状态类型，仅支持 1（攻击保持）和 2（独立计时）")
 
     def add(self, timer: Timer):
+        if self.expire_mode == "resource":
+            return
         prev = self.current
 
         if self.type == 1:
@@ -116,7 +119,7 @@ class State:
         prev = self.current
 
         if self.type == 1:
-            if timer.current_time - self.start_time > self.length:
+            if timer.current_time - self.start_time > self.time:
                 self.current = 0
                 self.start_time = 0
         elif self.type == 2:
@@ -306,6 +309,34 @@ class ResourceStateRule:
             # 只要条件满足，每次调用都触发（可能连续叠层）
             if active:
                 self.state.add(timer)
+
+class ShadowResourceProxy:
+    """
+    影子资源代理：接口长得像 Resource，但内部读写的是 temp 数值表。
+    """
+    def __init__(self, real_res: Resource, temp_dict: dict):
+        self._real = real_res
+        self._temp = temp_dict  # {real_res: [cur, upper]}
+        self.id = real_res.id
+
+    @property
+    def upper_limit(self):
+        return self._temp[self._real][1]
+
+    @property
+    def current(self):
+        return self._temp[self._real][0]
+
+    def update(self, amount: float):
+        EPS = 1e-9
+        cur, lim = self._temp[self._real]
+        if amount < 0:
+            if cur + amount < -EPS:
+                raise ValueError(f"[shadow] 资源 {self.id} 数量不足")
+            cur = max(0.0, cur + amount)
+        elif amount > 0:
+            cur = min(lim, cur + amount)
+        self._temp[self._real][0] = cur
 
 
 class ResourceStateRemoveRule:
@@ -555,9 +586,9 @@ class Operation:
         resource_outputs,
         resource_consumes,
         resource_produces,
-        consume_upper_limit,
-        consume_lower_limit,
         statesoutput,
+        consume_upper_limits = None,
+        consume_lower_limits = None,
         resource_state_rules=None,
         state_requirements=None,   # ✅ 新增：需要的状态
         state_forbids=None,         # ✅ 新增：禁止的状态
@@ -581,9 +612,18 @@ class Operation:
         assert len(self.resource_outputs) == len(self.resource_produces), \
             "resource_outputs 和 resource_produces 长度必须一致"
 
+        n = len(self.resource_requirements)
+        def _normalize_limit(x):
+            if x is None:
+                return [None] * n
+            if isinstance(x, (int, float)):
+                x = [x] * n
+            assert len(x) == n, "consume_upper_limits/consume_lower_limits 长度必须与 resource_requirements 一致"
+            return list(x)
+
         # 消耗上下限（对每个资源都适用）
-        self.consume_upper_limit = consume_upper_limit
-        self.consume_lower_limit = consume_lower_limit
+        self.consume_upper_limits = _normalize_limit(consume_upper_limits)
+        self.consume_lower_limits = _normalize_limit(consume_lower_limits)
 
         # 直接施加的状态
         self.statesoutput = list(statesoutput)
@@ -683,14 +723,16 @@ class Operation:
         不考虑当前资源，只考虑配置 + 状态修正。
         """
         raw_map = {}
-        for res, base in zip(self.resource_requirements, self.resource_consumes):
+        for i, (res, base) in enumerate(zip(self.resource_requirements, self.resource_consumes)):
             c = base
-            if self.consume_upper_limit is not None:
-                c = min(c, self.consume_upper_limit)
-            if self.consume_lower_limit is not None:
-                c = max(c, self.consume_lower_limit)
-            raw_map[res] = c
-
+            upper = self.consume_upper_limits[i]
+            lower = self.consume_lower_limits[i]
+            if upper is not None:
+                c = min(c, upper)
+            if lower is not None:
+                c = max(c, lower)
+            raw_map[res] = c   
+ 
         # 状态对消耗做修正（可能加减乘除）
         modified_map = self._apply_state_effects_to_map(
             raw_map, target_kind="consume", state_override=state_override
@@ -698,13 +740,19 @@ class Operation:
         modified_map = self._apply_op_efficiency_rules(modified_map, target_kind="consume", state_manager=state_manager)
 
         consume_map = {}
+        # 需要一个res->index的映射，才能在dict上按资源中找到对应上限
+        res_to_idx = {r: i for i, r in enumerate(self.resource_requirements)}
         for res, amt in modified_map.items():
             if amt < 0:
                 amt = 0
-            if self.consume_upper_limit is not None:
-                amt = min(amt, self.consume_upper_limit)
+            i = res_to_idx[res]
+            upper = self.consume_upper_limits[i]
+            lower = self.consume_lower_limits[i]
+            if upper is not None:
+                amt = min(amt, upper)
+            if lower is not None:
+                amt = max(amt, lower)
             consume_map[res] = amt
-
         return consume_map
     
     def _calc_produce_amounts(self, state_override=None, state_manager=None):
@@ -819,10 +867,11 @@ class Operation:
         if not self._check_state_conditions(state_override=None):
             return False
         
-        if self.consume_lower_limit is not None:
-            for res in self.resource_requirements:
-                if res.current < self.consume_lower_limit:
-                    return False
+        for i, res in enumerate(self.resource_requirements):
+            lower = self.consume_lower_limits[i]
+            if lower is not None and res.current < lower:
+                return False
+
 
         consume_map = self._calc_consume_amounts(state_manager=state_manager)
 
@@ -964,12 +1013,31 @@ class MetaOperation:
         return priority
 
 
-    def _build_shadow_states(self, state_manager: StateManager):
+    def _build_shadow_states(self, state_manager: StateManager, shadow_res_map: dict):
         """
         从当前 StateManager 和所有 Operation 中，构建“原始State -> 影子State”的映射，
         并返回影子 StateManager。
         """
         shadow_map = {}
+        def _clone_resource_effects(st: State):
+            if not getattr(st, "resource_effects", None):
+                return []
+            cloned = []
+            for eff in st.resource_effects:
+                real_r = eff.resource
+                if real_r not in shadow_res_map:
+                    # 影子模拟 temp 里没用到这个资源，就跳过（或你也可以强制加入 temp）
+                    continue
+                cloned.append(StateResourceEffect(
+                    resource=shadow_res_map[real_r],
+                    on_add=eff.on_add,
+                    on_remove=eff.on_remove,
+                    per_stack=eff.per_stack,
+                    ratio_on_add=eff.ratio_on_add,
+                    ratio_on_remove=eff.ratio_on_remove,
+                ))
+            return cloned
+
 
         # 1）先把 state_manager 中的状态都拷一份
         for st in state_manager.states:
@@ -979,7 +1047,7 @@ class MetaOperation:
                 st.upper_limit, 
                 st.time, st.type, 
                 st.length, 
-                resource_effects = None, 
+                resource_effects = _clone_resource_effects(st), 
                 meta_priority_rules = list(st.meta_priority_rules),
                 op_accelerate_rules = list(getattr(st, "op_accelerate_rules", [])),
                 op_efficiency_rules = list(getattr(st, "op_efficiency_rules", [])),)
@@ -1001,7 +1069,7 @@ class MetaOperation:
                 st.time, 
                 st.type, 
                 st.length,
-                resource_effects = None,
+                resource_effects = _clone_resource_effects(st),
                 meta_priority_rules = list(st.meta_priority_rules),
                 op_accelerate_rules = list(getattr(st, "op_accelerate_rules", [])),
                 op_efficiency_rules = list(getattr(st, "op_efficiency_rules", [])),)
@@ -1020,6 +1088,12 @@ class MetaOperation:
                 ensure_shadow(eff.state)
             for st in op.statesoutput:
                 ensure_shadow(st)
+            # 资源-状态，规则里引用到的state也要有影子
+            for rule in getattr(op, "resource_state_rules", []):
+                ensure_shadow(rule.state)
+            # 资源-状态移除规则
+            for rule in getattr(op, "resource_state_remove_rules", []):
+                ensure_shadow(rule.state)
 
         shadow_manager = StateManager(list(shadow_map.values()))
         return shadow_map, shadow_manager
@@ -1045,9 +1119,26 @@ class MetaOperation:
             for out in op.resource_outputs:
                 if out not in temp:
                     temp[out] = [out.current, out.upper_limit]
-
+        for st in state_manager.states:
+            for eff in getattr(st, "resource_effects",[]) or []:
+                r = eff.resource
+                if r not in temp:
+                    temp[r] = [r.current, r.upper_limit]
+        
+        # 把resource_state_rules / remove_rules里涉及的资源也加入temp
+        for op in self.operations:
+            for rule in getattr(op, "resource_state_rules", []):
+                r = rule.resource
+                if r not in temp:
+                    temp[r] = [r.current, r.upper_limit]
+            for rule in getattr(op, "resource_state_remove_rules", []):
+                r = rule.resource
+                if r not in temp:
+                    temp[r] = [r.current, r.upper_limit]
+                    
+        shadow_res_map = {r: ShadowResourceProxy(r, temp) for r in temp.keys()}
         # ---------- 影子状态 ----------
-        shadow_state_map, shadow_state_manager = self._build_shadow_states(state_manager)
+        shadow_state_map, shadow_state_manager = self._build_shadow_states(state_manager, shadow_res_map)
 
         # ---------- 影子时间 ----------
         shadow_timer = Timer(total_time=timer.total_time)
@@ -1062,6 +1153,12 @@ class MetaOperation:
                 if shadow_state_map[st].current > 0:
                     return False
             return True
+
+         # ✅ shadow: once 触发的“上一次是否满足”记录（不污染真实 rule.was_active）
+        shadow_was_active = {}
+        for op in self.operations:
+            for rule in getattr(op, "resource_state_rules", []) or []:
+                shadow_was_active[rule] = getattr(rule, "was_active", False)
         
         # ---------- 按顺序模拟每个 Operation ----------
         last_tick = shadow_timer.current_time
@@ -1071,12 +1168,12 @@ class MetaOperation:
                 return False
 
             # 2. 资源门槛：至少要 >= consume_lower_limit（如果有）
-            if op.consume_lower_limit is not None:
-                for res in op.resource_requirements:
-                    cur, lim = temp[res]
-                    if cur < op.consume_lower_limit:
+            for i, res in enumerate(op.resource_requirements):
+                lower = op.consume_lower_limits[i]
+                if lower is not None:
+                    cur, _ = temp[res]
+                    if cur < lower:
                         return False
-
             # 3. 计算理论消耗量（使用影子状态参与 state_effects）
             consume_map = op._calc_consume_amounts(state_override=shadow_state_map, state_manager=shadow_state_manager)
 
@@ -1096,6 +1193,53 @@ class MetaOperation:
                 cur, lim = temp[out_res]
                 cur = min(lim, cur + amount)
                 temp[out_res][0] = cur
+            
+            # 4.5 影子触发：资源-状态（在时间推进前，和真实operate顺序一致）
+            for rule in getattr(op, "resource_state_rules", []) or []:
+                r = rule.resource
+                val = temp[r][0]
+
+                # 条件判断（和 ResourceStateRule._condition 一致）
+                if rule.mode == ">=":
+                    active = val >= rule.threshold
+                elif rule.mode == "<=":
+                    active = val <= rule.threshold
+                else:
+                    raise ValueError(f"未知比较模式: {rule.mode}")
+
+                if rule.once:
+                    prev_active = shadow_was_active.get(rule, False)
+                    if active and not prev_active:
+                        shadow_state_map[rule.state].add(shadow_timer)
+                        shadow_was_active[rule] = True
+                    elif not active:
+                        shadow_was_active[rule] = False
+                else:
+                    if active:
+                        shadow_state_map[rule.state].add(shadow_timer)
+            # 4.6 影子触发：资源-移除状态
+            for rule in getattr(op, "resource_state_remove_rules", []) or []:
+                r = rule.resource
+                val = temp[r][0]
+
+                if rule.mode == "<=":
+                    ok = val <= rule.threshold
+                elif rule.mode == ">=":
+                    ok = val >= rule.threshold
+                elif rule.mode == "==":
+                    ok = val == rule.threshold
+                else:
+                    raise ValueError(f"未知比较模式: {rule.mode}")
+
+                if not ok:
+                    continue
+
+                st_shadow = shadow_state_map[rule.state]
+                if rule.require_active and st_shadow.current <= 0:
+                    continue
+
+                # 用 State.force_clear()，确保影子资源改动（resource_effects）也会结算
+                st_shadow.force_clear()
 
             # 5. 推进影子时间 & 状态过期
             eff_time = op.get_effective_time(shadow_state_manager)
@@ -1495,8 +1639,8 @@ def make_operation_with_charges(
     resource_outputs,
     resource_consumes,
     resource_produces,
-    consume_upper_limit=None,
-    consume_lower_limit=None,
+    consume_upper_limits=None,
+    consume_lower_limits=None,
     statesoutput=None,
     *,
     # === 充能相关 ===
@@ -1533,8 +1677,8 @@ def make_operation_with_charges(
         resource_outputs=list(resource_outputs),
         resource_consumes=list(resource_consumes),
         resource_produces=list(resource_produces),
-        consume_upper_limit=consume_upper_limit,
-        consume_lower_limit=consume_lower_limit,
+        consume_upper_limits=consume_upper_limits,
+        consume_lower_limits=consume_lower_limits,
         statesoutput=statesoutput,
         resource_state_rules=resource_state_rules,
         state_requirements=state_requirements,
