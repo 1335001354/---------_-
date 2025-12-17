@@ -353,3 +353,4 @@ log = character.build_rotation_from_meta(max_steps=10)
 > - 加速 / 优先级 / 消耗的统一抽象
 >
 > 非常适合作为中大型技能系统的数值内核。
+> 后续优化方向需要将伤害提升纳入优先级变化的考虑范畴
