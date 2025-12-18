@@ -54,9 +54,9 @@ class State:
        2 = 独立计时模型（每一层有自己的过期时间）
     6. length: 最大可同时存在的“计时槽”(对 type=2 有用)
     7. meta_priority_rules: 元操作优先级规则列表
-        - 结构：[(meta_op, priority_delta), ...]
+        - 结构：[(meta_op, priority_delta, min_stack=1), ...]
         - 默认：None 或 [] -> 不修改优先级
-        - 状态存在时（current > 0）会对其中的 meta_op 优先级加上 priority_delta
+        - 状态存在时（current >= min_stack）会对其中的 meta_op 优先级加上 priority_delta
         - 状态结束（current=0）后，优先级自动恢复为 base_priority。
     8. op_accelerate_rules: 状态存在时对操作生效的加速规则列表 [OperationAccelerate,...]
     """
@@ -1006,8 +1006,26 @@ class MetaOperation:
                 if not getattr(st, "meta_priority_rules", None):
                     continue
 
-                for meta_op, delta in st.meta_priority_rules:
-                    if meta_op is self:
+                for rule in st.meta_priority_rules:
+                    # 兼容两种写法：(meta_op, delta) 或 (meta_op, delta, min_stack)
+                    if not isinstance(rule, (list, tuple)):
+                        continue
+                    if len(rule) >= 3:
+                        meta_op, delta, min_stack = rule[0], rule[1], rule[2]
+                    elif len(rule) == 2:
+                        meta_op, delta = rule
+                        min_stack = 1
+                    else:
+                        continue
+
+                    try:
+                        need = int(min_stack)
+                    except Exception:
+                        need = 1
+                    if need < 1:
+                        need = 1
+
+                    if meta_op is self and st.current >= need:
                         priority += delta
 
         return priority
@@ -1721,6 +1739,9 @@ def make_operation_with_charges(
     # 3) 把充能当作“额外的资源需求”：每次操作消耗 1 层
     op.resource_requirements.append(charge_res)
     op.resource_consumes.append(1.0)
+    # 补齐充能资源对应的上下限占位，避免后续按索引访问时报错
+    op.consume_upper_limits.append(None)
+    op.consume_lower_limits.append(None)
 
     # 4) 若设置了 charge_cd，则为充能挂一条时间回复规则
     if charge_cd is not None and charge_cd > 0:
