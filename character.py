@@ -594,6 +594,8 @@ class Operation:
         state_forbids=None,         # ✅ 新增：禁止的状态
         resource_state_remove_rules=None,
         state_effects=None,
+        max_charges = 1,
+        charge_cd = 0.0,
     ):
         # 基本信息
         self.id = id
@@ -645,7 +647,57 @@ class Operation:
 
         # 统计
         self.counter = 0  # 该操作被执行次数
+        # charges config (clamp)
+        mc = int(max_charges) if max_charges is not None else 1
+        if mc < 1:
+            mc = 1
+        cd = float(charge_cd or 0.0)
+        if cd < 0:
+            cd = 0.0
+        self.max_charges = mc
+        self.charge_cd = cd
+        self.charges = mc
+        self.charge_clock = 0.0
 
+    def configure_charges(self, max_charges: int = 1, charge_cd: float = 0.0, init_charges=None):
+        mc = int(max_charges) if max_charges is not None else 1
+        if mc < 1:
+            mc = 1
+        self.max_charges = mc
+
+        self.charge_cd = float(charge_cd or 0.0)
+        if self.charge_cd < 0:
+            self.charge_cd = 0.0
+
+        if init_charges is None:
+            self.charges = self.max_charges
+        else:
+            self.charges = max(0, min(self.max_charges, int(init_charges)))
+
+        self.charge_clock = 0.0
+
+
+    def regen_charges(self, dt: float):
+        """随时间回充（dt=秒）。只有 charges < max_charges 且 charge_cd>0 才生效。"""
+        if dt is None or dt <= 0:
+            return
+        if self.max_charges <= 1:
+            # 上限1视为无充能，不需要回充逻辑
+            self.charges = 1
+            self.charge_clock = 0.0
+            return
+        if self.charge_cd <= 0:
+            return
+
+        if self.charges >= self.max_charges:
+            self.charge_clock = 0.0
+            return
+
+        self.charge_clock += dt
+        gained = int(self.charge_clock // self.charge_cd)
+        if gained > 0:
+            self.charges = min(self.max_charges, self.charges + gained)
+            self.charge_clock -= gained * self.charge_cd
 
         # ---------- 内部：对某一类资源数量应用 state_effects ----------
     def _apply_state_effects_to_map(self, amount_map, target_kind: str, state_override=None):
@@ -866,6 +918,10 @@ class Operation:
         """
         if not self._check_state_conditions(state_override=None):
             return False
+
+        if self.max_charges > 1:
+            if self.charges <= 0:
+                return False
         
         for i, res in enumerate(self.resource_requirements):
             lower = self.consume_lower_limits[i]
@@ -893,6 +949,12 @@ class Operation:
             raise ValueError(f"资源或状态条件不足，无法执行操作 {self.id}")
 
         self.counter += 1
+
+        # 消耗充能（先扣）
+        if self.max_charges > 1:
+            if self.charges <= 0:
+                raise ValueError(f"操作 {self.id} 充能不足，无法执行")
+            self.charges -= 1
 
         # 1. 资源消耗
         consume_map = self._calc_consume_amounts(state_manager=state_manager)
@@ -1162,6 +1224,11 @@ class MetaOperation:
         shadow_timer = Timer(total_time=timer.total_time)
         shadow_timer.current_time = timer.current_time
 
+        shadow_charge = {}
+
+        for op in self.operations:
+            shadow_charge[op] = [getattr(op, "charges", 1), getattr(op, "charge_clock", 0.0)]
+
         def _regen_allowed(rule: ResourceRegenRule):
             # 检查 regen_rule 的状态条件是否满足
             for st, need in rule.state_requirements:
@@ -1184,6 +1251,13 @@ class MetaOperation:
             # 1. 用影子状态检查状态条件
             if not op._check_state_conditions_shadow(shadow_state_map):
                 return False
+            
+            if getattr(op, "max_charges", 1) > 1:
+                ch, clk = shadow_charge[op]
+                if ch <= 0:
+                    return False
+                # 执行消耗1层
+                shadow_charge[op][0] = ch - 1
 
             # 2. 资源门槛：至少要 >= consume_lower_limit（如果有）
             for i, res in enumerate(op.resource_requirements):
@@ -1262,14 +1336,29 @@ class MetaOperation:
             # 5. 推进影子时间 & 状态过期
             eff_time = op.get_effective_time(shadow_state_manager)
             shadow_timer.update(eff_time)
-            if regen_rules:
-                dt = shadow_timer.current_time - last_tick
-                if dt > 0:
+            dt = shadow_timer.current_time - last_tick
+            if dt > 0:
+                if regen_rules:
                     for rule in regen_rules:
                         # rule.resource是真实的Resource对象，用它来索引temp
                         r = rule.resource
                         if r in temp and _regen_allowed(rule):
                             temp[r][0] = min(temp[r][1], temp[r][0] + rule.rate_per_sec * dt)
+                for op2 in self.operations:
+                    mc = int(getattr(op2, "max_charges", 1) or 1)
+                    cd = float(getattr(op2, "charge_cd", 0.0) or 0.0)
+                    if mc <= 1 or cd <= 0.0:
+                        continue
+                    ch, clk = shadow_charge[op2]
+                    if ch >= mc:
+                        shadow_charge[op2][1] = 0.0
+                        continue
+                    clk += dt
+                    gained = int(clk // cd)
+                    if gained > 0:
+                        ch = min(mc, ch + gained)
+                        clk -= gained * cd
+                    shadow_charge[op2] = [ch, clk]
                 last_tick = shadow_timer.current_time
             shadow_state_manager.update(shadow_timer)
 
@@ -1565,6 +1654,8 @@ class Character:
             return
         for rule in self.resource_regen_rules:
             rule.apply(dt)
+        for op in self.operations:
+            op.regen_charges(dt)
         self._last_tick_time = now
 
     # ---------- 逻辑 1：基于元操作的循环 ----------
@@ -1648,111 +1739,3 @@ class Character:
                 break
 
         return rotation_log
-
-def make_operation_with_charges(
-    character: "Character",
-    op_id,
-    time,
-    resource_requirements,
-    resource_outputs,
-    resource_consumes,
-    resource_produces,
-    consume_upper_limits=None,
-    consume_lower_limits=None,
-    statesoutput=None,
-    *,
-    # === 充能相关 ===
-    max_charges: int = 1,      # 最大充能层数，普通技能=1，特殊技能>1
-    charge_cd: float | None = None,   # 单层充能CD（秒）。None 或 <=0 表示不随时间回复
-    charge_res_id: str | None = None, # 充能资源在角色里的 id，不传则默认 "charge_<op_id>"
-    # === 下面这些是你 Operation 的原始可选参数，照抄一遍，默认给 None ===
-    resource_state_rules=None,
-    state_requirements=None,
-    state_forbids=None,
-    resource_state_remove_rules=None,
-    state_effects=None,
-):
-    """
-    创建一个带“充能机制”的 Operation，并自动：
-    - 为其配置充能 Resource（可复用已有的）
-    - 为充能挂上 ResourceRegenRule（按 charge_cd 逐层回复）
-    - 注册到 character.operations / character.resources / character.resource_regen_rules
-    """
-
-    # 防御式默认值处理
-    statesoutput = list(statesoutput) if statesoutput else []
-    resource_state_rules = list(resource_state_rules) if resource_state_rules else []
-    state_requirements = list(state_requirements) if state_requirements else []
-    state_forbids = list(state_forbids) if state_forbids else []
-    resource_state_remove_rules = list(resource_state_remove_rules) if resource_state_remove_rules else []
-    state_effects = list(state_effects) if state_effects else []
-
-    # 1) 先按“没有充能”的方式创建 Operation
-    op = Operation(
-        id=op_id,
-        time=time,
-        resource_requirements=list(resource_requirements),
-        resource_outputs=list(resource_outputs),
-        resource_consumes=list(resource_consumes),
-        resource_produces=list(resource_produces),
-        consume_upper_limits=consume_upper_limits,
-        consume_lower_limits=consume_lower_limits,
-        statesoutput=statesoutput,
-        resource_state_rules=resource_state_rules,
-        state_requirements=state_requirements,
-        state_forbids=state_forbids,
-        resource_state_remove_rules=resource_state_remove_rules,
-        state_effects=state_effects,
-    )
-
-    # 2) 准备“充能资源”
-    if max_charges is None or max_charges <= 0:
-        # 不需要充能机制，直接注册 op 返回
-        character.add_operation(op)
-        return op
-
-    if charge_res_id is None:
-        charge_res_id = f"charge_{op_id}"
-
-    # 如果角色里已经有同名充能资源，就复用（方便多种形态共享充能池）
-    if charge_res_id in character.resources:
-        charge_res = character.resources[charge_res_id]
-        # 确保上限至少是 max_charges
-        charge_res.upper_limit = max(charge_res.upper_limit, max_charges)
-        # 当前值不要超过上限
-        if charge_res.current > charge_res.upper_limit:
-            charge_res.current = charge_res.upper_limit
-    else:
-        # 否则新建一个充能资源，初始即满层
-        charge_res = Resource(
-            id=charge_res_id,
-            upper_limit=max_charges,
-            current=max_charges,
-        )
-        character.add_resource(charge_res)
-
-    # 把一些充能信息挂在 op 身上（方便调试）
-    op.max_charges = max_charges
-    op.charge_cd = charge_cd
-    op.charge_resource = charge_res
-
-    # 3) 把充能当作“额外的资源需求”：每次操作消耗 1 层
-    op.resource_requirements.append(charge_res)
-    op.resource_consumes.append(1.0)
-    # 补齐充能资源对应的上下限占位，避免后续按索引访问时报错
-    op.consume_upper_limits.append(None)
-    op.consume_lower_limits.append(None)
-
-    # 4) 若设置了 charge_cd，则为充能挂一条时间回复规则
-    if charge_cd is not None and charge_cd > 0:
-        rate = 1.0 / charge_cd  # 每秒回复 1 / cd 层
-        regen_rule = ResourceRegenRule(
-            resource=charge_res,
-            rate_per_sec=rate,
-        )
-        character.add_regen_rule(regen_rule)
-
-    # 5) 最后把这个技能注册到角色
-    character.add_operation(op)
-
-    return op
