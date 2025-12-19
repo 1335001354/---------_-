@@ -88,7 +88,13 @@ class State:
 
     def add(self, timer: Timer):
         if self.expire_mode == "resource":
+            prev = self.current
+            self.current = min(self.upper_limit, self.current + 1)
+            gained = self.current - prev
+            if gained > 0:
+                self._apply_resource_on_gain(gained)
             return
+        
         prev = self.current
 
         if self.type == 1:
@@ -116,6 +122,8 @@ class State:
 
 
     def remove(self, timer: Timer):
+        if self.expire_mode == "resource":
+            return
         prev = self.current
 
         if self.type == 1:
@@ -938,7 +946,7 @@ class Operation:
 
         return True
 
-    def operate(self, timer: Timer, state_manager: StateManager = None):
+    def operate(self, timer: Timer, state_manager: StateManager = None, *, apply_statesoutput: bool = True):
         """
         执行一次操作：
 
@@ -984,10 +992,9 @@ class Operation:
         else:
             dt = getattr(self, "base_time", self.time)
         timer.update(dt)
-
-        # 5. 本操作直接施加的状态
-        for st in self.statesoutput:
-            st.add(timer)
+        if apply_statesoutput:
+            for st in self.statesoutput:
+                st.add(timer)
 
         consume_by_id = {res.id: c for res, c in consume_map.items()}
         return [self.id, self.counter, timer.current_time, consume_by_id]
@@ -1130,7 +1137,9 @@ class MetaOperation:
                 resource_effects = _clone_resource_effects(st), 
                 meta_priority_rules = list(st.meta_priority_rules),
                 op_accelerate_rules = list(getattr(st, "op_accelerate_rules", [])),
-                op_efficiency_rules = list(getattr(st, "op_efficiency_rules", [])),)
+                op_efficiency_rules = list(getattr(st, "op_efficiency_rules", [])),
+                expire_mode=getattr(st, "expire_mode", "time"),
+            )
             # 拷贝 start_time（保持相对时间关系）
             if st.type == 1:
                 shadow.start_time = st.start_time
@@ -1152,7 +1161,9 @@ class MetaOperation:
                 resource_effects = _clone_resource_effects(st),
                 meta_priority_rules = list(st.meta_priority_rules),
                 op_accelerate_rules = list(getattr(st, "op_accelerate_rules", [])),
-                op_efficiency_rules = list(getattr(st, "op_efficiency_rules", [])),)
+                op_efficiency_rules = list(getattr(st, "op_efficiency_rules", [])),
+                expire_mode=getattr(st, "expire_mode", "time"),
+            )
             if st.type == 1:
                 shadow.start_time = st.start_time
             elif st.type == 2:
@@ -1178,7 +1189,7 @@ class MetaOperation:
         shadow_manager = StateManager(list(shadow_map.values()))
         return shadow_map, shadow_manager
 
-    def _simulate_full(self, timer: Timer, state_manager: StateManager, regen_rules = None):
+    def _simulate_full(self, timer: Timer, state_manager: StateManager, regen_rules = None, op_trigger_rules = None):
         """
         使用影子 Resource / Timer / State 来完整模拟整个元操作：
         - 状态条件用影子State判断
@@ -1336,6 +1347,8 @@ class MetaOperation:
             # 5. 推进影子时间 & 状态过期
             eff_time = op.get_effective_time(shadow_state_manager)
             shadow_timer.update(eff_time)
+            for st in op.statesoutput:
+                shadow_state_map[st].add(shadow_timer)
             dt = shadow_timer.current_time - last_tick
             if dt > 0:
                 if regen_rules:
@@ -1343,7 +1356,9 @@ class MetaOperation:
                         # rule.resource是真实的Resource对象，用它来索引temp
                         r = rule.resource
                         if r in temp and _regen_allowed(rule):
-                            temp[r][0] = min(temp[r][1], temp[r][0] + rule.rate_per_sec * dt)
+                            rate = rule.rate_per_sec
+                            newv = temp[r][0] + rate * dt
+                            temp[r][0] = max(0.0, min(temp[r][1], newv))  # 不超过上限
                 for op2 in self.operations:
                     mc = int(getattr(op2, "max_charges", 1) or 1)
                     cd = float(getattr(op2, "charge_cd", 0.0) or 0.0)
@@ -1359,12 +1374,16 @@ class MetaOperation:
                         ch = min(mc, ch + gained)
                         clk -= gained * cd
                     shadow_charge[op2] = [ch, clk]
+                if op_trigger_rules:
+                    for rule in op_trigger_rules:
+                        rule.try_apply(
+                            executed_op = op,
+                            timer = shadow_timer,
+                            state_override = shadow_state_map,
+                            res_override = shadow_res_map,
+                        )
                 last_tick = shadow_timer.current_time
             shadow_state_manager.update(shadow_timer)
-
-            # 6. 本操作直接施加的状态，作用在影子状态上
-            for st in op.statesoutput:
-                shadow_state_map[st].add(shadow_timer)
 
         return True
 
@@ -1383,9 +1402,10 @@ class MetaOperation:
         elif self.type == 2:
             if timer is None or state_manager is None:
                 raise ValueError("MetaOperation(type=2).can_execute() 需要提供 timer 和 state_manager")
-            return self._simulate_full(timer, state_manager, regen_rules=getattr(character, "resource_regen_rules", None))
-
-
+            return self._simulate_full(timer, state_manager, 
+                                    regen_rules=getattr(character, "resource_regen_rules", None),
+                                    op_trigger_rules=getattr(character, "op_triggered_state_rules", None),
+                                    )
         else:
             raise ValueError("MetaOperation.type 只能为 1 或 2")
 
@@ -1463,8 +1483,9 @@ class ResourceThreshold:
         self.threshold = threshold
         self.mode = mode
 
-    def check(self) -> bool:
-        v = self.resource.current
+    def check(self, res_override=None) -> bool:
+        r = res_override.get(self.resource, self.resource) if res_override else self.resource
+        v = r.current
         if self.mode == ">=":
             return v >= self.threshold
         if self.mode == "<=":
@@ -1501,35 +1522,37 @@ class OperationTriggeredStateRule:
         self.add_stacks = add_stacks
         self.once_per_operation_call = once_per_operation_call
 
-    def _check_states(self) -> bool:
+    def _check_states(self, state_override=None) -> bool:
         for st, need in self.required_states:
-            if st.current < need:
+            s = state_override.get(st, st) if state_override else st
+            if s.current < need:
                 return False
         for st in self.forbidden_states:
-            if st.current > 0:
+            s = state_override.get(st, st) if state_override else st
+            if s.current > 0:
                 return False
         return True
 
-    def _check_resources(self) -> bool:
+    def _check_resources(self, res_override=None) -> bool:
         for th in self.resource_thresholds:
-            if not th.check():
+            if not th.check(res_override=res_override):
                 return False
         return True
 
-    def try_apply(self, executed_op: Operation, timer: Timer):
+    def try_apply(self, executed_op: Operation, timer: Timer, *, state_override=None, res_override=None):
         # 必须是指定操作触发
         if executed_op is not self.trigger_operation:
             return
 
         # AND 条件
-        if not self._check_states():
+        if not self._check_states(state_override=state_override):
             return
-        if not self._check_resources():
+        if not self._check_resources(res_override=res_override):
             return
-
+        tgt = state_override.get(self.target_state, self.target_state) if state_override else self.target_state
         # 触发：加 b 状态
         for _ in range(max(0, int(self.add_stacks))):
-            self.target_state.add(timer)
+            tgt.add(timer)
 
 class OperationResourceEfficiency:
     """
@@ -1731,8 +1754,8 @@ class Character:
                 if op.test(state_manager=self.state_manager):
                     rec = op.operate(self.timer, self.state_manager)
                     rotation_log.append(rec)
-                    self._after_operation_executed(op)
                     self._apply_time_regen()
+                    self._after_operation_executed(op)
                     executed = True
                     break
             if not executed:
